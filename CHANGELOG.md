@@ -1,6 +1,7 @@
 # Changelog
 
 ## [Unreleased]
+- Fixed `spawn EINVAL` error on Windows with Node 22+ when launching `.cmd` shims (PR #69).
 
 ## [1.1.5]
 - Security fix: prevent path-traversal READ and DELETE of arbitrary `.json` files via `cacheKey` parameter (CWE-22).
