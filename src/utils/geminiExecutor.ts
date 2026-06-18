@@ -1,4 +1,5 @@
 import * as path from 'path';
+import { readFileSync, realpathSync } from 'fs';
 import { executeCommand } from './commandExecutor.js';
 import { Logger } from './logger.js';
 import {
@@ -14,6 +15,9 @@ import { chunkChangeModeEdits } from './changeModeChunker.js';
 import { cacheChunks, getChunks } from './chunkCache.js';
 
 const FILE_REF_PATTERN = /@(\S+)/g;
+// Inlining only: @ must start the prompt or follow whitespace, so user@host or
+// a@b aren't inlined. The guard above stays broad (it must reject any traversal).
+const FILE_REF_INLINE_PATTERN = /(?<=^|\s)@(\S+)/g;
 
 /**
  * Rejects @file references that resolve outside the working directory.
@@ -27,35 +31,52 @@ const FILE_REF_PATTERN = /@(\S+)/g;
  */
 export function assertSafeFileReferences(prompt: string, root: string = process.cwd()): void {
   const normalizedRoot = path.resolve(root);
+  // Canonicalize the root once so a symlinked root (e.g. /tmp -> /private/tmp
+  // on macOS) doesn't make legitimate in-root targets look like escapes.
+  let realRoot: string;
+  try {
+    realRoot = realpathSync(normalizedRoot);
+  } catch {
+    realRoot = normalizedRoot;
+  }
+  const escapes = (p: string, base: string) =>
+    p !== base && !p.startsWith(base + path.sep);
   for (const match of prompt.matchAll(FILE_REF_PATTERN)) {
     const ref = match[1];
     const resolved = path.resolve(normalizedRoot, ref);
-    const escapesRoot =
-      resolved !== normalizedRoot && !resolved.startsWith(normalizedRoot + path.sep);
     // `~` is rejected explicitly: path.resolve treats it as a literal segment,
     // so a home-directory reference would otherwise look contained.
-    if (ref.startsWith('~') || escapesRoot) {
+    if (ref.startsWith('~') || escapes(resolved, normalizedRoot)) {
       throw new Error(
         `Refusing @file reference outside the project directory: "@${ref}". ` +
+        `Only files within ${normalizedRoot} may be referenced.`
+      );
+    }
+    // Symlink-aware re-check: the lexical test above cannot see through an
+    // in-root symlink whose target lies outside the root. A path that doesn't
+    // resolve is fine here — nothing is read, and the CLI reports it.
+    let real: string | undefined;
+    try {
+      real = realpathSync(resolved);
+    } catch {
+      real = undefined;
+    }
+    if (real !== undefined && escapes(real, realRoot)) {
+      throw new Error(
+        `Refusing @file reference resolving outside the project directory: "@${ref}". ` +
         `Only files within ${normalizedRoot} may be referenced.`
       );
     }
   }
 }
 
-export async function executeGeminiCLI(
-  prompt: string,
-  model?: string,
-  sandbox?: boolean,
-  changeMode?: boolean,
-  onProgress?: (newOutput: string) => void
-): Promise<string> {
-  let prompt_processed = prompt;
-
-  if (changeMode) {
-    prompt_processed = prompt.replace(/file:(\S+)/g, '@$1');
-
-    const changeModeInstructions = `
+/**
+ * Wraps a user request in the changeMode instruction template that makes the
+ * model emit machine-applicable OLD/NEW edit blocks. The format is model- and
+ * CLI-agnostic, so both the gemini and agy backends share this builder.
+ */
+export function buildChangeModePrompt(userRequest: string): string {
+  return `
 [CHANGEMODE INSTRUCTIONS]
 You are generating code modifications that will be processed by an automated system. The output format is critical because it enables programmatic application of changes without human intervention.
 
@@ -113,9 +134,83 @@ NEW:
 IMPORTANT: The OLD section must be an EXACT copy from the file that can be found with Ctrl+F!
 
 USER REQUEST:
-${prompt_processed}
+${userRequest}
 `;
-    prompt_processed = changeModeInstructions;
+}
+
+/**
+ * changeMode preprocessing shared by both backends: rewrite `file:foo` -> `@foo`
+ * so the inlining/guard path treats them as file refs, then wrap the request in
+ * the OLD/NEW template. One implementation so gemini and agy cannot drift.
+ */
+export function prepareChangeModePrompt(prompt: string): string {
+  return buildChangeModePrompt(prompt.replace(/file:(\S+)/g, '@$1'));
+}
+
+/**
+ * Replaces every in-project `@path` reference with the file's contents inlined
+ * in a delimited block. The Gemini CLI does this inlining itself; the agy
+ * backend does NOT reliably inline `@file` (it is agent-first and decides to
+ * read files via its own tools), so for agy we inline ourselves to keep both
+ * determinism and the CVE-2026-0755 project-root guard in the data path.
+ */
+export function inlineFileReferences(prompt: string, root: string = process.cwd()): string {
+  // Reuse the same guard the gemini path relies on; rejects ~, absolute,
+  // traversal and out-of-root-symlink references before we read anything.
+  assertSafeFileReferences(prompt, root);
+  const normalizedRoot = path.resolve(root);
+  // Compare real targets against the canonicalized root (see the note in
+  // assertSafeFileReferences about symlinked roots).
+  let realRoot: string;
+  try {
+    realRoot = realpathSync(normalizedRoot);
+  } catch {
+    realRoot = normalizedRoot;
+  }
+  const escapesRoot = (p: string) =>
+    p !== realRoot && !p.startsWith(realRoot + path.sep);
+  return prompt.replace(FILE_REF_INLINE_PATTERN, (whole, ref: string) => {
+    const resolved = path.resolve(normalizedRoot, ref);
+    // Symlink-aware guard: assertSafeFileReferences is lexical (path.resolve),
+    // so an in-root symlink could still point outside the root. Resolve the real
+    // target and re-check before reading. realpathSync throws on a missing path —
+    // that is handled below as "not found" (no contents leaked).
+    let real: string;
+    try {
+      real = realpathSync(resolved);
+    } catch (e) {
+      Logger.warn(`inlineFileReferences: could not resolve @${ref}: ${(e as Error).message}`);
+      return `\n----- FILE NOT FOUND: ${ref} -----\n`;
+    }
+    if (escapesRoot(real)) {
+      throw new Error(
+        `Refusing @file reference resolving outside the project directory: "@${ref}". ` +
+        `Only files within ${normalizedRoot} may be referenced.`
+      );
+    }
+    try {
+      const content = readFileSync(real, 'utf8');
+      return `\n----- BEGIN FILE: ${ref} -----\n${content}\n----- END FILE: ${ref} -----\n`;
+    } catch (e) {
+      Logger.warn(`inlineFileReferences: could not read @${ref}: ${(e as Error).message}`);
+      // Leave a visible marker rather than the raw token so the model isn't
+      // misled into thinking a file was provided.
+      return `\n----- FILE NOT FOUND: ${ref} -----\n`;
+    }
+  });
+}
+
+export async function executeGeminiCLI(
+  prompt: string,
+  model?: string,
+  sandbox?: boolean,
+  changeMode?: boolean,
+  onProgress?: (newOutput: string) => void
+): Promise<string> {
+  let prompt_processed = prompt;
+
+  if (changeMode) {
+    prompt_processed = prepareChangeModePrompt(prompt);
   }
 
   // Block @file references that escape the project root before the prompt
